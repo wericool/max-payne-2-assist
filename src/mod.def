@@ -1,0 +1,3 @@
+LIBRARY MP2Assist
+EXPORTS
+    Initialize=_Initialize@4

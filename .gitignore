@@ -1,0 +1,10 @@
+/build/
+/release/
+/research/
+/WidescreenFixesPack-mp2/
+*.user
+*.suo
+*.pdb
+*.obj
+*.log
+MP2Assist.ini
