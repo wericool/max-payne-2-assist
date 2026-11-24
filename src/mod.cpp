@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <string_view>
 
 #include "settings.hpp"
 #include "game_panel.hpp"
@@ -43,9 +44,10 @@ using MouseUpdate = void(__thiscall*)(void*, float);
 using SwapBuffer = void(__thiscall*)(void*, const RECT*);
 using FindBone = void*(__thiscall*)(void*, const void*);
 
-HMODULE gameObjects, graphics, levelRuntime, sharedDb, kf2, physics;
+HMODULE gameObjects, graphics, levelRuntime, sharedDb, kf2, physics, messages;
 CharacterTick originalPost;
 CharacterDestruct originalDestruct;
+CharacterDestruct originalItemUpdate;
 CharacterWeapons originalWeapons;
 GetPointer originalFirstScene;
 GetFloat originalAccuracy;
@@ -54,15 +56,16 @@ SwapBuffer originalSwap;
 MouseUpdate originalMouseUpdate;
 bool playerWeaponUpdate;
 AssistSettings settings;
-bool espVisible = true;
-bool diagnostic, menuOpen, mouseDown, mouseClicked, rangeDragging;
+bool diagnostic, menuOpen, insertWasDown, mouseDown, mouseClicked;
+int draggedRangeRow = -1;
 int menuRow;
+AssistPanel::Tab menuTab = AssistPanel::Tab::enemies;
 Point menuCursor{};
-bool espActive() { return espVisible && (settings.boxes || settings.skeleton || settings.head || settings.health); }
+bool enemyEspActive() { return settings.boxes || settings.skeleton || settings.head || settings.health; }
+bool itemEspActive() { return settings.painkillers || settings.ammo || settings.weapons || settings.explosives; }
+bool espActive() { return enemyEspActive() || itemEspActive(); }
 wchar_t profilePath[MAX_PATH];
 AssistPanel::Panel panel;
-constexpr int keys[] = {VK_F6, VK_F7, VK_INSERT, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
-std::array<bool, std::size(keys)> oldKeys{};
 constexpr DWORD boxColors[] = {0xffff524e, 0xff53e3d4, 0xffffd15c};
 constexpr DWORD boneColors[] = {0xffffb166, 0xffa9fff3, 0xfffff0a5};
 DWORD playerSeen;
@@ -96,8 +99,21 @@ struct Target {
     unsigned validBones;
 };
 std::array<Target, 256> targets;
-std::array<Vertex, targets.size() * (boneCount + 4 + maxHeadVertices) * 2> lines;
-std::array<Vertex, targets.size() * 12> healthVertices;
+enum class ItemKind { painkiller, ammo, weapon, explosive, unknown };
+enum class Icon { health, ammo, weapon, blast, canister, barrel, cylinder, crate, tank, monitor,
+                  grenade, molotov, melee, beretta, berettaDual, desertEagle, desertEagleDual,
+                  sawedOff, shotgun, striker, ingram, ingramDual, mp5, carbine, kalashnikov, sniper, dragunov };
+struct Item { Vec position; ItemKind kind; Icon icon; };
+struct ItemMarker { Point position; ItemKind kind; Icon icon; };
+constexpr size_t itemCapacity = 1024;
+std::array<Item, itemCapacity> items;
+std::array<ItemMarker, itemCapacity> itemMarkers;
+size_t itemCount, itemMarkerCount;
+DWORD itemsSeen;
+std::array<unsigned, 4> projectedItems;
+
+std::array<Vertex, (targets.size() * (boneCount + 4 + maxHeadVertices) + itemCapacity * 24) * 2> lines;
+std::array<Vertex, targets.size() * 12 + itemCapacity * 6> healthVertices;
 unsigned lineVertices, barVertices;
 unsigned projectedTargets, projectedBones, projectedHeads, projectedHealth;
 
@@ -118,6 +134,191 @@ struct LegacyString {
     const char* text() const { return capacity < 16 ? inlineText : heapText; }
 };
 static_assert(sizeof(LegacyString) == 28);
+
+bool itemEnabled(ItemKind kind) {
+    switch (kind) {
+    case ItemKind::painkiller: return settings.painkillers;
+    case ItemKind::ammo: return settings.ammo;
+    case ItemKind::weapon: return settings.weapons;
+    case ItemKind::explosive: return settings.explosives;
+    default: return false;
+    }
+}
+
+bool containsAscii(std::string_view text, std::string_view word) {
+    const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? char(c + ('a' - 'A')) : c; };
+    return std::search(text.begin(), text.end(), word.begin(), word.end(),
+                       [&](char a, char b) { return lower(a) == lower(b); }) != text.end();
+}
+
+struct Pickup { ItemKind kind; Icon icon; };
+
+Icon weaponIconFor(std::string_view message, size_t opening) {
+    auto name = message.substr(opening + 1);
+    const auto first = name.find_first_not_of(" \t");
+    if (first == std::string_view::npos) return Icon::weapon;
+    name.remove_prefix(first);
+    name = name.substr(0, name.find_first_of(" \t,)"));
+    // The authored order in the game's HUD sprite sheet.
+    constexpr const char* names[] = {
+        "grenade", "molotov", "melee", "beretta", "berettadual", "deserteagle", "deserteagledual",
+        "sawedshotgun", "pumpshotgun", "striker", "ingram", "ingramdual", "mp5", "coltcommando",
+        "kalashnikov", "sniper", "dragunov",
+    };
+    for (size_t row = 0; row < std::size(names); ++row) {
+        if (name.size() == std::strlen(names[row]) && _strnicmp(name.data(), names[row], name.size()) == 0) {
+            return static_cast<Icon>(static_cast<size_t>(Icon::grenade) + row);
+        }
+    }
+    return Icon::weapon;
+}
+
+Pickup identifyPickup(void* definition) {
+    using GetInt = int(__thiscall*)(void*);
+    using GetName = const LegacyString*(__thiscall*)(void*);
+    using GetMessage = const LegacyString*(__thiscall*)(void*, int);
+    const auto* name = at<GetName>(sharedDb, 0x22220)(definition);
+    if (_stricmp(name->text(), "Painkiller") == 0) return {ItemKind::painkiller, Icon::health};
+    const int count = at<GetInt>(sharedDb, 0x12d50)(definition);
+    bool ammo = false;
+    for (int index = 0; index < std::clamp(count, 0, 64); ++index) {
+        const auto& message = *at<GetMessage>(sharedDb, 0x12d60)(definition, index);
+        const std::string_view text(message.text(), message.length);
+        const auto open = text.find('(');
+        if (open == std::string_view::npos) continue;
+        const auto command = text.substr(0, open);
+        if (containsAscii(command, "c_pickupweapon")) return {ItemKind::weapon, weaponIconFor(text, open)};
+        ammo |= containsAscii(command, "c_pickupammo");
+    }
+    return ammo ? Pickup{ItemKind::ammo, Icon::ammo} : Pickup{ItemKind::unknown, Icon::weapon};
+}
+
+// The runtime FSM keeps parsed message vectors and state-keyed trees after the level string pool is released.
+template<class Predicate>
+bool searchMessageTree(void* tree, const Predicate& predicate) {
+    const auto sentinel = field<void*>(tree, 4);
+    const auto count = field<unsigned>(tree, 8);
+    if (!sentinel || !count || count > 4096) return false;
+    const auto search = [&](const auto& self, void* node, unsigned depth) -> bool {
+        if (!node || node == sentinel || depth == 32) return false;
+        return predicate(node) || self(self, field<void*>(node, 0), depth + 1) ||
+               self(self, field<void*>(node, 8), depth + 1);
+    };
+    return search(search, field<void*>(sentinel, 4), 0);
+}
+
+bool hasExplosionMessage(void* list, unsigned receiver) {
+    auto* first = field<void**>(list, 4);
+    auto* end = field<void**>(list, 8);
+    const auto bytes = reinterpret_cast<uintptr_t>(end) - reinterpret_cast<uintptr_t>(first);
+    if (!first || bytes > 512 * sizeof(void*) || bytes % sizeof(void*)) return false;
+    for (auto* cursor = first; cursor != end; ++cursor) {
+        void* message = *cursor;
+        if (!message || field<void*>(message, 0) != at<void*>(gameObjects, 0x121b70) ||
+            field<unsigned>(message, 0x0c) != receiver) continue;
+        const auto* projectile = static_cast<const char*>(message) + 0x30;
+        if (containsAscii({projectile, strnlen_s(projectile, 32)}, "damage_explosion")) return true;
+    }
+    return false;
+}
+
+bool hasExplosionGroup(void* group, unsigned receiver) {
+    auto* bytes = static_cast<Byte*>(group);
+    return hasExplosionMessage(group, receiver) || hasExplosionMessage(bytes + 0x1c, receiver) ||
+           searchMessageTree(bytes + 0x10, [receiver](void* node) {
+               return hasExplosionMessage(static_cast<Byte*>(node) + 0x28, receiver);
+           });
+}
+
+bool hasExplosionScript(void* object) {
+    auto* bytes = static_cast<Byte*>(object);
+    const unsigned receiver = field<unsigned short>(object, 0x1a0);
+    if (hasExplosionGroup(bytes + 0x1fc, receiver)) return true;
+    for (const unsigned offset : {0x228u, 0x234u, 0x240u}) {
+        if (searchMessageTree(bytes + offset, [receiver](void* node) {
+            void* group = field<void*>(node, 0x28);
+            return group && hasExplosionGroup(group, receiver);
+        })) return true;
+    }
+    return false;
+}
+
+std::string_view objectNamePart(std::string_view path) {
+    const auto split = path.rfind("::");
+    return split == std::string_view::npos ? path : path.substr(split + 2);
+}
+
+Icon explosiveIconFor(std::string_view path) {
+    const auto name = objectNamePart(path);
+    const auto prefab = path.rfind("::prefab::");
+    const auto parent = prefab == std::string_view::npos ? std::string_view{} : objectNamePart(path.substr(0, prefab));
+    const auto named = [&](std::string_view type) { return containsAscii(name, type) || containsAscii(parent, type); };
+    if (containsAscii(name, "canister") || containsAscii(name, "jerry") ||
+        containsAscii(name, "gascan") || containsAscii(name, "gas_can") ||
+        containsAscii(name, "fuelcan") || containsAscii(name, "explosivecan") ||
+        containsAscii(name, "explodingcan") ||
+        (name.size() >= 3 && _strnicmp(name.data(), "can", 3) == 0)) return Icon::canister;
+    if (named("barrel") || named("drum")) return Icon::barrel;
+    if (named("cylinder") || named("bottle") || named("propane") || named("gasbott")) return Icon::cylinder;
+    if (named("crate") || named("box")) return Icon::crate;
+    if (named("tank")) return Icon::tank;
+    if (named("monitor")) return Icon::monitor;
+    return Icon::blast;
+}
+
+void captureExplosives() {
+    using GetArray = void*(__fastcall*)(int);
+    using IsValid = bool(__thiscall*)(void*, int);
+    using GetMapped = void**(__thiscall*)(void*, int);
+    using GetName = const LegacyString*(__thiscall*)(void*);
+    const int classId = *at<int*>(gameObjects, 0x198594);
+    if (classId < 0) return;
+
+    void* objects = at<GetArray>(messages, 0x10000)(classId);
+    if (!objects) return;
+    const int slots = field<int>(objects, 4);
+    if (slots < 0 || slots > 32768) return;
+    for (int index = 0; index < slots && itemCount < items.size(); ++index) {
+        if (!at<IsValid>(messages, 0xc2b0)(objects, index)) continue;
+        void* object = *at<GetMapped>(messages, 0xc2c0)(objects, index);
+        if (!object || !at<GetBool>(gameObjects, 0xc5b20)(object) || field<Byte>(object, 0x295)) continue;
+        auto* base = static_cast<Byte*>(object) + 0x30;
+        if (!at<GetBool>(levelRuntime, 0x1430)(base)) continue;
+        const auto& state = *at<GetName>(gameObjects, 0xa6930)(object);
+        if (containsAscii({state.text(), state.length}, "exploded")) continue;
+        if (!hasExplosionScript(object)) continue;
+        const auto& name = *at<GetName>(levelRuntime, 0x1420)(base);
+        Vec position = *at<GetVec>(levelRuntime, 0x1aa0)(base);
+        position.y += 0.30f;
+        items[itemCount++] = {position, ItemKind::explosive, explosiveIconFor({name.text(), name.length})};
+    }
+}
+
+void __fastcall captureLevelItems(void* implementation, void*) {
+    originalItemUpdate(implementation);
+    itemCount = 0;
+    itemsSeen = GetTickCount();
+    if (!itemEspActive()) return;
+    using Next = void(__thiscall*)(void**);
+    void* sentinel = field<void*>(implementation, 0x10);
+    if (sentinel && (settings.painkillers || settings.ammo || settings.weapons)) {
+        void* node = field<void*>(sentinel, 0);
+        while (node && node != sentinel && itemCount < items.size()) {
+            void* item = field<void*>(node, 0x0c);
+            if (item && at<GetBool>(levelRuntime, 0x1430)(item)) {
+                void* definition = field<void*>(item, 0x98);
+                const Pickup pickup = definition ? identifyPickup(definition) : Pickup{ItemKind::unknown, Icon::weapon};
+                if (itemEnabled(pickup.kind)) {
+                    Vec position = *at<GetVec>(levelRuntime, 0x1aa0)(item);
+                    position.y += 0.12f;
+                    items[itemCount++] = {position, pickup.kind, pickup.icon};
+                }
+            }
+            at<Next>(gameObjects, 0xf0500)(&node);
+        }
+    }
+    if (settings.explosives) captureExplosives();
+}
 
 Vec transform(const Matrix& m, const Vec& v) {
     return {
@@ -257,7 +458,7 @@ void __fastcall postPhysics(void* character, void*, const void* timeUpdate) {
     }
 
     // Auto-aim eligibility is authored for each character skin and can be changed by the level.
-    if (!espActive() || !canDrawTarget(character) || !field<void*>(character, 0x404)) {
+    if (!enemyEspActive() || !canDrawTarget(character) || !field<void*>(character, 0x404)) {
         if (slot) clearTarget(*slot);
         return;
     }
@@ -377,6 +578,8 @@ bool withinEspDistance(const Vec& player, const Vec& target, float limitSquared)
 
 void projectTargets(void* camera) {
     lineVertices = barVertices = projectedTargets = projectedBones = projectedHeads = projectedHealth = 0;
+    itemMarkerCount = 0;
+    projectedItems.fill(0);
     const DWORD now = GetTickCount();
     if (!espActive() || !playerSeen || now - playerSeen > 350) return;
 
@@ -392,6 +595,19 @@ void projectTargets(void* camera) {
         return std::abs(out.x) < 8 && std::abs(out.y) < 8;
     };
 
+    if (itemEspActive() && itemsSeen && now - itemsSeen <= 350) {
+        const float limit = static_cast<float>(espDistances[settings.itemDistance].meters);
+        for (size_t index = 0; index < itemCount; ++index) {
+            const auto& item = items[index];
+            if (!itemEnabled(item.kind) || !withinEspDistance(playerPosition, item.position, limit * limit)) continue;
+            Point position;
+            if (!screenPoint(item.position, position) || position.x <= 0 || position.x >= 1 ||
+                position.y <= 0 || position.y >= 1) continue;
+            itemMarkers[itemMarkerCount++] = {position, item.kind, item.icon};
+            ++projectedItems[static_cast<size_t>(item.kind)];
+        }
+    }
+    if (!enemyEspActive()) return;
     const DWORD color = boxColors[settings.color];
     const float limit = static_cast<float>(espDistances[settings.espDistance].meters);
     const float limitSquared = limit * limit;
@@ -441,6 +657,136 @@ void projectTargets(void* camera) {
     }
 }
 
+struct IconEdge { int x1, y1, x2, y2; };
+
+constexpr IconEdge healthIcon[] = {
+    {-2,-7,2,-7}, {2,-7,2,-2}, {2,-2,7,-2}, {7,-2,7,2}, {7,2,2,2}, {2,2,2,7},
+    {2,7,-2,7}, {-2,7,-2,2}, {-2,2,-7,2}, {-7,2,-7,-2}, {-7,-2,-2,-2}, {-2,-2,-2,-7},
+};
+constexpr IconEdge ammoIcon[] = {
+    {-4,7,4,7}, {-4,7,-4,-2}, {4,7,4,-2}, {-4,-2,0,-8}, {0,-8,4,-2},
+    {-4,-1,4,-1}, {-4,4,4,4},
+};
+constexpr IconEdge weaponIcon[] = {
+    {-8,-5,8,-5}, {8,-5,8,0}, {8,0,1,0}, {1,0,-1,5}, {-1,5,-6,5},
+    {-6,5,-4,0}, {-4,0,-8,0}, {-8,0,-8,-5}, {4,-5,4,-3}, {-4,0,1,0},
+};
+constexpr IconEdge explosionIcon[] = {
+    {0,-8,2,-4}, {2,-4,6,-6}, {6,-6,5,-2}, {5,-2,8,0}, {8,0,5,2}, {5,2,6,6},
+    {6,6,2,4}, {2,4,0,8}, {0,8,-2,4}, {-2,4,-6,6}, {-6,6,-5,2}, {-5,2,-8,0},
+    {-8,0,-5,-2}, {-5,-2,-6,-6}, {-6,-6,-2,-4}, {-2,-4,0,-8},
+};
+constexpr IconEdge canisterIcon[] = {
+    {-6,-4,-3,-4}, {-3,-4,-3,-8}, {-3,-8,4,-8}, {4,-8,4,-5}, {4,-5,7,-2}, {7,-2,7,7},
+    {7,7,-6,7}, {-6,7,-6,-4}, {0,-5,3,-5}, {-3,-1,4,4}, {4,-1,-3,4},
+};
+constexpr IconEdge barrelIcon[] = {
+    {-6,-6,6,-6}, {6,-6,7,6}, {7,6,5,8}, {5,8,-5,8}, {-5,8,-7,6}, {-7,6,-6,-6},
+    {-6,-6,-4,-8}, {-4,-8,4,-8}, {4,-8,6,-6}, {-6,-2,6,-2}, {-7,4,7,4},
+};
+constexpr IconEdge cylinderIcon[] = {
+    {-2,-8,2,-8}, {2,-8,2,-5}, {2,-5,5,-3}, {5,-3,5,6}, {5,6,3,8}, {3,8,-3,8},
+    {-3,8,-5,6}, {-5,6,-5,-3}, {-5,-3,-2,-5}, {-2,-5,-2,-8}, {-5,2,5,2},
+};
+constexpr IconEdge crateIcon[] = {
+    {-8,-6,8,-6}, {8,-6,8,6}, {8,6,-8,6}, {-8,6,-8,-6}, {-7,-5,7,5}, {7,-5,-7,5},
+};
+constexpr IconEdge tankIcon[] = {
+    {-7,-5,7,-5}, {7,-5,9,-3}, {9,-3,9,3}, {9,3,7,5}, {7,5,-7,5}, {-7,5,-9,3},
+    {-9,3,-9,-3}, {-9,-3,-7,-5}, {-4,5,-4,8}, {4,5,4,8}, {1,-5,1,-8}, {1,-8,5,-8},
+};
+constexpr IconEdge monitorIcon[] = {
+    {-8,-7,8,-7}, {8,-7,8,4}, {8,4,-8,4}, {-8,4,-8,-7}, {0,4,0,7}, {-4,7,4,7},
+    {-5,0,-2,-3}, {-2,-3,1,1}, {1,1,5,-2},
+};
+struct ItemIcon { const IconEdge* edges; size_t count; DWORD color; };
+constexpr ItemIcon itemIcons[] = {
+    {healthIcon, std::size(healthIcon), 0xff79f6a5},
+    {ammoIcon, std::size(ammoIcon), 0xfff9dc85},
+    {weaponIcon, std::size(weaponIcon), 0xff77d8ff},
+    {explosionIcon, std::size(explosionIcon), 0xffff8b63},
+    {canisterIcon, std::size(canisterIcon), 0xffff8b63},
+    {barrelIcon, std::size(barrelIcon), 0xffffad68},
+    {cylinderIcon, std::size(cylinderIcon), 0xffffb58b},
+    {crateIcon, std::size(crateIcon), 0xffffca86},
+    {tankIcon, std::size(tankIcon), 0xffff9c9a},
+    {monitorIcon, std::size(monitorIcon), 0xffffc0a4},
+};
+static_assert(std::size(itemIcons) == static_cast<size_t>(Icon::grenade));
+
+struct WeaponVertex { float x, y, z, rhw; DWORD color; float u, v; };
+std::array<WeaponVertex, itemCapacity * 6> weaponVertices;
+
+void* weaponTexture(void* device) {
+    using GetMap = void*(__fastcall*)();
+    using ValidateMap = void(__thiscall*)(void*);
+    using Ref = ULONG(WINAPI*)(void*);
+    static void* texture = nullptr;
+    static void* lastDevice = nullptr;
+    static DWORD lastSearch = 0;
+    if (device != lastDevice) {
+        if (texture) vtable<Ref>(texture, 2)(texture);
+        texture = nullptr;
+        lastDevice = device;
+        lastSearch = 0;
+    }
+    if (texture) return texture;
+    const DWORD now = GetTickCount();
+    if (lastSearch && now - lastSearch < 1000) return nullptr;
+    lastSearch = now;
+
+    const auto next = at<GetMap>(graphics, 0x255d0);
+    for (void* map = at<GetMap>(graphics, 0x25140)(); map; map = next()) {
+        const auto& name = field<LegacyString>(map, 0xb0);
+        if (_stricmp(name.text(), "HUD: Weapon inventory") != 0) continue;
+        void* driverMap = field<void*>(map, 4);
+        if (!driverMap || !field<void*>(driverMap, 0x30)) {
+            at<ValidateMap>(graphics, 0x25ce0)(map);
+            driverMap = field<void*>(map, 4);
+        }
+        texture = driverMap ? field<void*>(driverMap, 0x30) : nullptr;
+        if (texture) {
+            vtable<Ref>(texture, 1)(texture);
+            log("Weapon ESP uses the game's HUD texture\r\n");
+        }
+        return texture;
+    }
+    return nullptr;
+}
+
+unsigned drawItemIcons(const Viewport& viewport, bool useWeaponTexture) {
+    const float scale = std::clamp(static_cast<float>(viewport.height) / 1000.0f, 0.8f, 1.6f);
+    unsigned weaponCount = 0;
+    for (size_t index = 0; index < itemMarkerCount; ++index) {
+        const auto& marker = itemMarkers[index];
+        const float x = static_cast<float>(viewport.x) + marker.position.x * static_cast<float>(viewport.width);
+        const float y = static_cast<float>(viewport.y) + marker.position.y * static_cast<float>(viewport.height);
+        const bool atlasIcon = marker.icon >= Icon::grenade;
+        if (atlasIcon && useWeaponTexture) {
+            const float left = x - 20 * scale, right = x + 20 * scale;
+            const float top = y - 10 * scale, bottom = y + 10 * scale;
+            addBarRect(left, top, right, bottom, 0xff20242b);
+            const unsigned row = static_cast<unsigned>(marker.icon) - static_cast<unsigned>(Icon::grenade);
+            const float v1 = row / 18.0f, v2 = (row + 1) / 18.0f;
+            constexpr DWORD tint = 0xffc7efff;
+            const WeaponVertex a{left, top, 0, 1, tint, 0, v1}, b{right, top, 0, 1, tint, 1, v1};
+            const WeaponVertex c{left, bottom, 0, 1, tint, 0, v2}, d{right, bottom, 0, 1, tint, 1, v2};
+            const WeaponVertex quad[] = {a, b, c, c, b, d};
+            std::copy(std::begin(quad), std::end(quad), weaponVertices.begin() + weaponCount);
+            weaponCount += 6;
+            continue;
+        }
+        const auto& glyph = itemIcons[static_cast<size_t>(atlasIcon ? Icon::weapon : marker.icon)];
+        const float radius = 10 * scale;
+        addBarRect(x - radius, y - radius, x + radius, y + radius, 0xff20242b);
+        for (size_t edge = 0; edge < glyph.count; ++edge) {
+            const auto& v = glyph.edges[edge];
+            addLine({x + v.x1 * scale, y + v.y1 * scale}, {x + v.x2 * scale, y + v.y2 * scale}, glyph.color);
+        }
+    }
+    return weaponCount;
+}
+
 void drawOverlay(void* device, unsigned width, unsigned height) {
     using Call = HRESULT(WINAPI*)(void*);
     using State = HRESULT(WINAPI*)(void*, DWORD);
@@ -458,7 +804,7 @@ void drawOverlay(void* device, unsigned width, unsigned height) {
     DWORD saved = 0;
     if (FAILED(vtable<CreateState>(device, 57)(device, 1, &saved))) return; // D3DSBT_ALL
     if (SUCCEEDED(vtable<Call>(device, 34)(device))) {
-        const auto overlayViewport = menuOpen ? full : vp;
+        const auto overlayViewport = menuOpen || itemMarkerCount ? full : vp;
         vtable<SetViewport>(device, 40)(device, &overlayViewport);
         auto renderState = vtable<StateValue>(device, 50);
         auto stage = vtable<Stage>(device, 63);
@@ -487,15 +833,37 @@ void drawOverlay(void* device, unsigned width, unsigned height) {
         };
         toViewport(lines.data(), lineVertices);
         toViewport(healthVertices.data(), barVertices);
+        void* atlas = projectedItems[static_cast<size_t>(ItemKind::weapon)] ? weaponTexture(device) : nullptr;
+        const unsigned weaponCount = drawItemIcons(full, atlas != nullptr);
         const auto barStatus = barVertices ? vtable<Draw>(device, 72)(
             device, 4, barVertices / 3, healthVertices.data(), sizeof(Vertex)) : S_OK;
         const auto status = lineVertices ?
             vtable<Draw>(device, 72)(device, 2, lineVertices / 2, lines.data(), sizeof(Vertex)) : S_OK;
+        if (weaponCount) {
+            vtable<State>(device, 76)(device, 0x144); // D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1
+            vtable<SetTexture>(device, 61)(device, 0, atlas);
+            stage(device, 0, 1, 4); // COLOROP = MODULATE
+            stage(device, 0, 2, 2); // COLORARG1 = TEXTURE
+            stage(device, 0, 3, 0); // COLORARG2 = DIFFUSE
+            stage(device, 0, 5, 2); // ALPHAARG1 = TEXTURE
+            stage(device, 0, 11, 0); // TEXCOORDINDEX
+            stage(device, 0, 13, 3); // ADDRESSU = CLAMP
+            stage(device, 0, 14, 3); // ADDRESSV = CLAMP
+            stage(device, 0, 16, 2); // MAGFILTER = LINEAR
+            stage(device, 0, 17, 2); // MINFILTER = LINEAR
+            stage(device, 0, 24, 0); // TEXTURETRANSFORMFLAGS = DISABLE
+            renderState(device, 19, 5); // D3DBLEND_SRCALPHA
+            renderState(device, 20, 6); // D3DBLEND_INVSRCALPHA
+            renderState(device, 27, 1);
+            vtable<Draw>(device, 72)(device, 4, weaponCount / 3, weaponVertices.data(), sizeof(WeaponVertex));
+            renderState(device, 27, 0);
+            stage(device, 0, 1, 2); // COLOROP = SELECTARG1
+        }
         if (menuOpen) {
             const float scale = std::clamp(static_cast<float>(height) / 750.0f, 0.65f, 1.4f);
             const float x = (static_cast<float>(width) - AssistPanel::width * scale) * 0.5f;
             const float y = (static_cast<float>(height) - AssistPanel::height * scale) * 0.30f;
-            const auto menuResult = panel.draw(device, x, y, scale, menuRow, settings, espVisible);
+            const auto menuResult = panel.draw(device, x, y, scale, menuTab, menuRow, settings);
             const float cx = x + menuCursor.x * scale, cy = y + menuCursor.y * scale;
             const auto cursorTriangle = [&](float size, DWORD color) {
                 const Vertex vertices[] = {{cx, cy, 0, 1, color}, {cx + 6 * size, cy + 18 * size, 0, 1, color},
@@ -516,6 +884,17 @@ void drawOverlay(void* device, unsigned width, unsigned height) {
                     log(message);
                     last = menuResult;
                 }
+            }
+        }
+        if (diagnostic) {
+            static std::array<unsigned, 4> lastItems{};
+            static unsigned reports;
+            if (projectedItems != lastItems && reports++ < 40) {
+                char message[160];
+                sprintf_s(message, "Item ESP: %u health, %u ammo, %u weapons, %u explosives\r\n",
+                          projectedItems[0], projectedItems[1], projectedItems[2], projectedItems[3]);
+                log(message);
+                lastItems = projectedItems;
             }
         }
         if (diagnostic) {
@@ -541,39 +920,48 @@ void drawOverlay(void* device, unsigned width, unsigned height) {
     vtable<State>(device, 56)(device, saved);
 }
 
-void setEspDistance(int step) {
+int distanceForRow(int row) {
+    return row == AssistPanel::enemyRangeRow ? settings.espDistance : settings.itemDistance;
+}
+
+void setEspDistance(int row, int step) {
+    const bool enemies = row == AssistPanel::enemyRangeRow;
+    int& current = enemies ? settings.espDistance : settings.itemDistance;
     step = std::clamp(step, 0, lastEspDistance);
-    if (step == settings.espDistance) return;
-    settings.espDistance = step;
-    writeSetting(profilePath, L"ESPDistance", step);
+    if (step == current) return;
+    current = step;
+    writeSetting(profilePath, enemies ? L"ESPDistance" : L"ESPItemDistance", step);
     panel.invalidate();
     if (diagnostic) {
-        char message[80];
-        sprintf_s(message, "ESP distance: %d m (0 = whole map)\r\n", espDistances[step].meters);
+        char message[90];
+        sprintf_s(message, "%s ESP distance: %d m (0 = whole map)\r\n",
+                  enemies ? "Enemy" : "Item", espDistances[step].meters);
         log(message);
     }
 }
 
-void changeMenuRow(int row, int direction) {
+void changeMenuRow(int row) {
+    const auto toggleItem = [](bool& enabled, const wchar_t* name) {
+        enabled = !enabled;
+        writeSetting(profilePath, name, enabled);
+    };
     switch (row) {
-    case AssistPanel::rangeRow:
-        setEspDistance(settings.espDistance + direction);
-        return;
+    case AssistPanel::painkillerRow: toggleItem(settings.painkillers, L"ESPPainkillers"); break;
+    case AssistPanel::ammoRow: toggleItem(settings.ammo, L"ESPAmmo"); break;
+    case AssistPanel::weaponRow: toggleItem(settings.weapons, L"ESPWeapons"); break;
+    case AssistPanel::explosiveRow: toggleItem(settings.explosives, L"ESPExplosives"); break;
     case 0:
         settings.boxes = !settings.boxes;
-        espVisible = true;
         writeSetting(profilePath, L"ESPBoxes", settings.boxes);
         log(settings.boxes ? "Boxes on\r\n" : "Boxes off\r\n");
         break;
     case 1:
         settings.skeleton = !settings.skeleton;
-        espVisible = true;
         writeSetting(profilePath, L"ESPSkeleton", settings.skeleton);
         log(settings.skeleton ? "Skeleton on\r\n" : "Skeleton off\r\n");
         break;
     case 2:
         settings.head = !settings.head;
-        espVisible = true;
         writeSetting(profilePath, L"ESPHead", settings.head);
         log(settings.head ? "Head marker on\r\n" : "Head marker off\r\n");
         break;
@@ -583,13 +971,12 @@ void changeMenuRow(int row, int direction) {
         log(settings.noSpread ? "No spread on\r\n" : "No spread off\r\n");
         break;
     case 4:
-        settings.color = (settings.color + direction + 3) % 3;
+        settings.color = (settings.color + 1) % 3;
         writeSetting(profilePath, L"Color", settings.color);
         log("ESP color changed\r\n");
         break;
     case 5:
         settings.health = !settings.health;
-        espVisible = true;
         writeSetting(profilePath, L"ESPHealth", settings.health);
         break;
     }
@@ -612,8 +999,8 @@ void __fastcall updateMouse(void* mouse, void*, float delta) {
     if (x || y) {
         menuCursor.x = std::clamp(menuCursor.x + static_cast<float>(x), 0.0f, float(AssistPanel::width - 1));
         menuCursor.y = std::clamp(menuCursor.y + static_cast<float>(y), 0.0f, float(AssistPanel::height - 1));
-        const int hover = AssistPanel::hitRow(menuCursor.x, menuCursor.y);
-        if (hover >= 0 && menuRow != hover) {
+        const int hover = AssistPanel::hitRow(menuTab, menuCursor.x, menuCursor.y);
+        if (draggedRangeRow < 0 && menuRow != hover) {
             menuRow = hover;
             panel.invalidate();
         }
@@ -641,58 +1028,55 @@ void updateMenu() {
     DWORD foregroundPid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPid);
     if (foregroundPid != GetCurrentProcessId()) {
-        oldKeys.fill(false);
+        insertWasDown = false;
         mouseClicked = false;
-        rangeDragging = false;
+        draggedRangeRow = -1;
         return;
     }
-    std::array<bool, std::size(keys)> press{};
-    for (size_t index = 0; index < press.size(); ++index) {
-        const bool down = (GetAsyncKeyState(keys[index]) & 0x8000) != 0;
-        press[index] = down && !oldKeys[index];
-        oldKeys[index] = down;
-    }
-    if (press[2]) {
+    const bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+    const bool toggle = insertDown && !insertWasDown;
+    insertWasDown = insertDown;
+    if (toggle) {
         menuOpen = !menuOpen;
         mouseClicked = false;
-        rangeDragging = false;
+        draggedRangeRow = -1;
         mouseDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        if (menuRow == AssistPanel::rangeRow) {
-            menuCursor = {float(AssistPanel::rangePosition(settings.espDistance)), float(AssistPanel::rangeTrack)};
+        if (AssistPanel::isRangeRow(menuRow)) {
+            menuCursor = {float(AssistPanel::rangePosition(distanceForRow(menuRow))),
+                          float(AssistPanel::rangeTrack(menuRow))};
         } else {
             menuCursor = {float(AssistPanel::width / 2),
-                          float(AssistPanel::firstRowTop + AssistPanel::rowStep * menuRow + 16)};
+                          float(AssistPanel::rowTop(AssistPanel::firstRow(menuTab)) + 16)};
         }
         if (!menuOpen) panel.clear();
         log(menuOpen ? "Menu open\r\n" : "Menu closed\r\n");
     }
-    if (press[0]) {
-        espVisible = !espVisible;
-        panel.invalidate();
-        log(espVisible ? "ESP resumed\r\n" : "ESP paused\r\n");
-    }
-    if (press[1]) changeMenuRow(3, 1);
     if (!menuOpen) return;
-    if (press[3] || press[4]) {
-        menuRow = (menuRow + (press[4] ? 1 : AssistPanel::rowCount - 1)) % AssistPanel::rowCount;
-        panel.invalidate();
-    }
-    if (press[5] || press[6]) changeMenuRow(menuRow, press[6] ? 1 : -1);
     if (mouseClicked) {
         mouseClicked = false;
-        const int row = AssistPanel::hitRow(menuCursor.x, menuCursor.y);
-        if (row == AssistPanel::rangeRow) {
+        if (AssistPanel::overTabs(menuCursor.x, menuCursor.y)) {
+            menuTab = menuCursor.x < AssistPanel::tabDivider ? AssistPanel::Tab::enemies : AssistPanel::Tab::items;
+            menuRow = -1;
+            draggedRangeRow = -1;
+            panel.invalidate();
+            log(menuTab == AssistPanel::Tab::enemies ? "Enemy tab selected\r\n" : "Item tab selected\r\n");
+            return;
+        }
+        const int row = AssistPanel::hitRow(menuTab, menuCursor.x, menuCursor.y);
+        if (AssistPanel::isRangeRow(row)) {
             menuRow = row;
             panel.invalidate();
-            rangeDragging = menuCursor.y >= AssistPanel::rangeTrack - 15;
-            if (rangeDragging) setEspDistance(AssistPanel::rangeStepAt(menuCursor.x));
+            if (menuCursor.y >= AssistPanel::rangeTrack(row) - 15) {
+                draggedRangeRow = row;
+                setEspDistance(row, AssistPanel::rangeStepAt(menuCursor.x));
+            }
         } else if (row >= 0) {
-            changeMenuRow(row, 1);
+            changeMenuRow(row);
         }
     }
-    if (rangeDragging) {
-        if (mouseDown) setEspDistance(AssistPanel::rangeStepAt(menuCursor.x));
-        else rangeDragging = false;
+    if (draggedRangeRow >= 0) {
+        if (mouseDown) setEspDistance(draggedRangeRow, AssistPanel::rangeStepAt(menuCursor.x));
+        else draggedRangeRow = -1;
     }
 }
 
@@ -713,13 +1097,17 @@ void __fastcall swapBuffer(void* driver, void*, const RECT* rect) {
                     lastHeight = height;
                 }
             }
-            if (width && height && (menuOpen || (espActive() && (lineVertices || barVertices)))) {
-                if (!espActive()) lineVertices = barVertices = 0;
+            if (width && height && (menuOpen || (espActive() && (lineVertices || barVertices || itemMarkerCount)))) {
+                if (!espActive()) {
+                    lineVertices = barVertices = 0;
+                    itemMarkerCount = 0;
+                }
                 drawOverlay(device, width, height);
             }
         }
     }
     lineVertices = barVertices = 0;
+    itemMarkerCount = 0;
     originalSwap(driver, rect);
 }
 
@@ -767,11 +1155,16 @@ bool installJump(Byte* entry, const Byte (&prefix)[Size], Function& original, Ho
 bool installRuntimeHooks() {
     auto* destruct = at<Byte*>(gameObjects, 0x40e00);
     constexpr Byte destructPrefix[] = {0x55, 0x8b, 0xe9, 0x8a, 0x85, 0x08, 0x01, 0, 0};
+    auto* updateItems = at<Byte*>(gameObjects, 0xeb5d0);
+    constexpr Byte itemPrefix[] = {0x51, 0x56, 0x57, 0x8b, 0xf9};
     constexpr Byte swapPrefix[] = {0x55, 0x8b, 0xec, 0x6a, 0xff};
     if (!installJump(destruct, destructPrefix, originalDestruct, &destructCharacter)) return false;
-    if (installJump(at<Byte*>(graphics, 0x2ce00), swapPrefix, originalSwap, &swapBuffer)) {
-        log("Direct3D overlay installed\r\n");
-        return true;
+    if (installJump(updateItems, itemPrefix, originalItemUpdate, &captureLevelItems)) {
+        if (installJump(at<Byte*>(graphics, 0x2ce00), swapPrefix, originalSwap, &swapBuffer)) {
+            log("Direct3D overlay installed\r\n");
+            return true;
+        }
+        writeMemory(updateItems, itemPrefix, sizeof(itemPrefix));
     }
     writeMemory(destruct, destructPrefix, sizeof(destructPrefix));
     return false;
@@ -809,7 +1202,8 @@ extern "C" DWORD WINAPI Initialize(void* options) {
     sharedDb = GetModuleHandleW(L"X_SharedDBMFC.dll");
     kf2 = GetModuleHandleW(L"KF2MFC.dll");
     physics = GetModuleHandleW(L"X_PhysicalSimulationMFC.dll");
-    if (!gameObjects || !graphics || !levelRuntime || !sharedDb || !kf2 || !physics) return 0;
+    messages = GetModuleHandleW(L"X_MessageMFC.dll");
+    if (!gameObjects || !graphics || !levelRuntime || !sharedDb || !kf2 || !physics || !messages) return 0;
     diagnostic = options != nullptr;
     HMODULE module = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

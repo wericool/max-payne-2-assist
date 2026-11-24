@@ -20,6 +20,8 @@ struct FileVersion { const wchar_t* file; const char* sha256; };
 constexpr FileVersion supported[] = {
     {L"MaxPayne2.exe", "B1677BD72F47E1ED7ABDBF5441149867C53FF0E0C2D1C3EECB1815FB718263AB"},
     {L"X_GameObjectsMFC.dll", "98823044E9BA0E9DFD61C0008C1831A2372CFCCD7A287314CC93E50B30AE2628"},
+    {L"X_LevelMFC.dll", "0C37C97E81D93619DB6F0A4B03947C4A05A4A45AEF50B5DF970EE4A58463CCD7"},
+    {L"X_MessageMFC.dll", "0CB2B59EEC07C6FEC01E5390F2A06977C8BFD733005ECA87218477BAEC2649DE"},
     {L"X_LevelRuntimeMFC.dll", "42565F3579EAF1F2D592CD4B60DB9257D1BB1CC5D9F6DE17D4A57545C14252B3"},
     {L"X_PhysicalSimulationMFC.dll", "CD97CB986712F7F540E7AF83353F4980B6C7AFFC997BD657946B78EC3F77C99F"},
     {L"X_SharedDBMFC.dll", "02684E6465EA6097A50D01A48D785D98B3197DF1966F4CCB1D18E3B576375C54"},
@@ -49,6 +51,23 @@ BYTE* remoteModule(DWORD process, const wchar_t* name) {
     return nullptr;
 }
 
+bool hasGameWindow(DWORD pid) {
+    const auto find = [](HWND window, LPARAM process) -> BOOL {
+        DWORD owner = 0;
+        GetWindowThreadProcessId(window, &owner);
+        if (owner != static_cast<DWORD>(process) || !IsWindowVisible(window)) return TRUE;
+        wchar_t title[128]{};
+        GetWindowTextW(window, title, static_cast<int>(std::size(title)));
+        constexpr wchar_t prefix[] = L"Max Payne 2 v1.01 - ";
+        return std::wcsncmp(title, prefix, std::size(prefix) - 1) != 0;
+    };
+    return !EnumWindows(find, static_cast<LPARAM>(pid));
+}
+
+bool gameReady(DWORD pid) {
+    return pid && hasGameWindow(pid) && remoteModule(pid, L"e2_d3d8_driver_mfc.dll");
+}
+
 bool remoteCall(HANDLE process, BYTE* entry, void* argument, DWORD& result) {
     Handle thread(CreateRemoteThread(process, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(entry),
                                      argument, 0, nullptr));
@@ -65,13 +84,7 @@ bool loadMod(HANDLE game, DWORD pid, const fs::path& dll, bool diagnostic) {
     wchar_t ownerPath[MAX_PATH]{};
     if (!GetModuleFileNameW(owner, ownerPath, MAX_PATH)) return false;
     const fs::path ownerName = fs::path(ownerPath).filename();
-    BYTE* loadHost = nullptr;
-    for (int attempt = 0; attempt < 200 && WaitForSingleObject(game, 0) == WAIT_TIMEOUT; ++attempt) {
-        loadHost = remoteModule(pid, ownerName.c_str());
-        if (loadHost && remoteModule(pid, L"X_GameObjectsMFC.dll")) break;
-        loadHost = nullptr;
-        Sleep(50);
-    }
+    BYTE* loadHost = remoteModule(pid, ownerName.c_str());
     if (!loadHost) return false;
 
     HMODULE localMod = LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
@@ -218,6 +231,7 @@ int waitForGame(const fs::path& exe, const fs::path& mod, bool diagnostic, std::
         DWORD pid = 0;
         do {
             pid = findGame(exe);
+            if (!gameReady(pid)) pid = 0;
             if (!pid && WaitForSingleObject(cancel, 300) != WAIT_TIMEOUT) return 0;
         } while (!pid);
         if (WaitForSingleObject(cancel, 0) != WAIT_TIMEOUT) return 0;
@@ -271,16 +285,16 @@ int run(const fs::path& gamePath, bool verifyOnly, bool diag, bool skipDialog,
             error = L"Не удалось запустить Steam.";
             return 1;
         }
-        for (int attempt = 0; attempt < 250 && !pid; ++attempt) {
-            Sleep(100);
-            pid = findGame(exe);
-        }
     } else if (remoteModule(pid, L"MP2Assist.dll")) {
         error = L"Игра уже запущена. Для смены разрешения или режима экрана перезапусти её.";
         return 1;
     }
-    if (!pid) {
-        error = L"Steam не запустил Max Payne 2 (RU). Проверь окно Steam.";
+    for (int attempt = 0; attempt < 250 && !gameReady(pid); ++attempt) {
+        Sleep(100);
+        pid = findGame(exe);
+    }
+    if (!gameReady(pid)) {
+        error = L"Основное окно Max Payne 2 (RU) не открылось. Проверь окно Steam.";
         return 1;
     }
     Handle game(OpenProcess(attachRights, FALSE, pid));

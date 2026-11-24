@@ -91,7 +91,7 @@ void createControls(Launcher& ui) {
     fillCombo(ui.resolution, resolutionItems, std::size(resolutionItems), saved.resolution);
     fillCombo(ui.display, displayItems, std::size(displayItems), saved.displayMode);
     fillCombo(ui.color, colorItems, std::size(colorItems), saved.color);
-    control(ui, L"STATIC", L"Insert — меню чита   ·   F6 — ESP   ·   F7 — разброс", 0, 32, 426, 430, 25);
+    control(ui, L"STATIC", L"Insert — открыть или закрыть меню в игре", 0, 32, 426, 430, 25);
     ui.play = control(ui, L"BUTTON", L"Играть через Steam", BS_OWNERDRAW | WS_TABSTOP,
                       32, 469, 209, 46, PlayId, ui.section);
     ui.trainer = control(ui, L"BUTTON", L"Ждать запуска", BS_OWNERDRAW | WS_TABSTOP,

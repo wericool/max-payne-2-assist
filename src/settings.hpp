@@ -20,6 +20,11 @@ struct AssistSettings {
     bool noSpread = true;
     int color = 0;
     int espDistance = lastEspDistance;
+    int itemDistance = lastEspDistance;
+    bool painkillers = true;
+    bool ammo = true;
+    bool weapons = true;
+    bool explosives = true;
 };
 
 struct Resolution { DWORD width, height; };
@@ -43,7 +48,10 @@ inline AssistSettings readSettings(const wchar_t* path) {
             read(L"ESPBoxes", oldEsp != 0, 1) != 0, read(L"ESPSkeleton", oldEsp == 2, 1) != 0,
             read(L"ESPHead", oldEsp != 0, 1) != 0, read(L"ESPHealth", 1, 1) != 0,
             read(L"NoSpread", 1, 1) != 0,
-            read(L"Color", 0, 2), read(L"ESPDistance", lastEspDistance, lastEspDistance)};
+            read(L"Color", 0, 2), read(L"ESPDistance", lastEspDistance, lastEspDistance),
+            read(L"ESPItemDistance", lastEspDistance, lastEspDistance),
+            read(L"ESPPainkillers", 1, 1) != 0, read(L"ESPAmmo", 1, 1) != 0,
+            read(L"ESPWeapons", 1, 1) != 0, read(L"ESPExplosives", 1, 1) != 0};
 }
 
 inline bool writeSetting(const wchar_t* path, const wchar_t* key, int value) {
