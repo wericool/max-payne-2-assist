@@ -51,21 +51,19 @@ BYTE* remoteModule(DWORD process, const wchar_t* name) {
     return nullptr;
 }
 
-bool hasGameWindow(DWORD pid) {
-    const auto find = [](HWND window, LPARAM process) -> BOOL {
-        DWORD owner = 0;
-        GetWindowThreadProcessId(window, &owner);
-        if (owner != static_cast<DWORD>(process) || !IsWindowVisible(window)) return TRUE;
-        wchar_t title[128]{};
-        GetWindowTextW(window, title, static_cast<int>(std::size(title)));
-        constexpr wchar_t prefix[] = L"Max Payne 2 v1.01 - ";
-        return std::wcsncmp(title, prefix, std::size(prefix) - 1) != 0;
-    };
-    return !EnumWindows(find, static_cast<LPARAM>(pid));
-}
-
 bool gameReady(DWORD pid) {
-    return pid && hasGameWindow(pid) && remoteModule(pid, L"e2_d3d8_driver_mfc.dll");
+    if (!pid || !remoteModule(pid, L"e2_d3d8_driver_mfc.dll")) return false;
+    const auto graphicsBase = reinterpret_cast<uintptr_t>(remoteModule(pid, L"e2mfc.dll"));
+    if (!graphicsBase) return false;
+    Handle game(OpenProcess(PROCESS_VM_READ, FALSE, pid));
+    if (!game.value) return false;
+    const auto readPointer = [&](uintptr_t address, uintptr_t& value) {
+        return ReadProcessMemory(game.value, reinterpret_cast<const void*>(address), &value, sizeof(value), nullptr) != FALSE;
+    };
+    // P_Driver::m_initializedDriver and the Direct3D device for the verified x86 build.
+    uintptr_t driver = 0, device = 0;
+    return readPointer(graphicsBase + 0x62400, driver) && driver &&
+           readPointer(driver + 0x100, device) && device;
 }
 
 bool remoteCall(HANDLE process, BYTE* entry, void* argument, DWORD& result) {

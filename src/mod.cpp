@@ -43,11 +43,16 @@ using Project = const Vec*(__thiscall*)(void*, const Vec*);
 using MouseUpdate = void(__thiscall*)(void*, float);
 using SwapBuffer = void(__thiscall*)(void*, const RECT*);
 using FindBone = void*(__thiscall*)(void*, const void*);
+using LevelProjectile = void(__thiscall*)(void*, void*, void*, const Vec*, const Vec*, const void*);
+using LoadProjectiles = void(__thiscall*)(void*, void*, const void*, const void*);
 
 HMODULE gameObjects, graphics, levelRuntime, sharedDb, kf2, physics, messages;
 CharacterTick originalPost;
 CharacterDestruct originalDestruct;
 CharacterDestruct originalItemUpdate;
+CharacterDestruct originalProjectileUnload;
+LoadProjectiles originalProjectileLoad;
+LevelProjectile originalLevelProjectile;
 CharacterWeapons originalWeapons;
 GetPointer originalFirstScene;
 GetFloat originalAccuracy;
@@ -103,9 +108,11 @@ enum class ItemKind { painkiller, ammo, weapon, explosive, unknown };
 enum class Icon { health, ammo, weapon, blast, canister, barrel, cylinder, crate, tank, monitor,
                   grenade, molotov, melee, beretta, berettaDual, desertEagle, desertEagleDual,
                   sawedOff, shotgun, striker, ingram, ingramDual, mp5, carbine, kalashnikov, sniper, dragunov };
-struct Item { Vec position; ItemKind kind; Icon icon; };
-struct ItemMarker { Point position; ItemKind kind; Icon icon; };
+struct ExplosiveRef { void* object = nullptr; unsigned slot = 0; };
+struct Item { Vec position; ItemKind kind; Icon icon; ExplosiveRef explosive; };
+struct ItemMarker { Point position; ItemKind kind; Icon icon; ExplosiveRef explosive; };
 constexpr size_t itemCapacity = 1024;
+std::array<void*, 32768> detonatedExplosives;
 std::array<Item, itemCapacity> items;
 std::array<ItemMarker, itemCapacity> itemMarkers;
 size_t itemCount, itemMarkerCount;
@@ -207,6 +214,12 @@ bool searchMessageTree(void* tree, const Predicate& predicate) {
     return search(search, field<void*>(sentinel, 4), 0);
 }
 
+bool isExplosionMessage(void* message) {
+    if (!message || field<void*>(message, 0) != at<void*>(gameObjects, 0x121b70)) return false;
+    const auto* projectile = static_cast<const char*>(message) + 0x30;
+    return containsAscii({projectile, strnlen_s(projectile, 32)}, "damage_explosion");
+}
+
 bool hasExplosionMessage(void* list, unsigned receiver) {
     auto* first = field<void**>(list, 4);
     auto* end = field<void**>(list, 8);
@@ -214,10 +227,7 @@ bool hasExplosionMessage(void* list, unsigned receiver) {
     if (!first || bytes > 512 * sizeof(void*) || bytes % sizeof(void*)) return false;
     for (auto* cursor = first; cursor != end; ++cursor) {
         void* message = *cursor;
-        if (!message || field<void*>(message, 0) != at<void*>(gameObjects, 0x121b70) ||
-            field<unsigned>(message, 0x0c) != receiver) continue;
-        const auto* projectile = static_cast<const char*>(message) + 0x30;
-        if (containsAscii({projectile, strnlen_s(projectile, 32)}, "damage_explosion")) return true;
+        if (isExplosionMessage(message) && field<unsigned>(message, 0x0c) == receiver) return true;
     }
     return false;
 }
@@ -266,22 +276,68 @@ Icon explosiveIconFor(std::string_view path) {
     return Icon::blast;
 }
 
-void captureExplosives() {
+void* dynamicObjectArray() {
     using GetArray = void*(__fastcall*)(int);
+    const int classId = *at<int*>(gameObjects, 0x198594);
+    return classId < 0 ? nullptr : at<GetArray>(messages, 0x10000)(classId);
+}
+
+void* mappedDynamicObject(void* objects, unsigned index) {
     using IsValid = bool(__thiscall*)(void*, int);
     using GetMapped = void**(__thiscall*)(void*, int);
-    using GetName = const LegacyString*(__thiscall*)(void*);
-    const int classId = *at<int*>(gameObjects, 0x198594);
-    if (classId < 0) return;
+    if (index >= field<unsigned>(objects, 4) || !at<IsValid>(messages, 0xc2b0)(objects, index)) return nullptr;
+    return *at<GetMapped>(messages, 0xc2c0)(objects, index);
+}
 
-    void* objects = at<GetArray>(messages, 0x10000)(classId);
+bool hasDetonated(const ExplosiveRef& ref) {
+    return ref.object && detonatedExplosives[ref.slot] == ref.object;
+}
+
+void __fastcall createLevelProjectile(void* self, void*, void* message, void* room,
+                                      const Vec* position, const Vec* target, const void* rotation) {
+    if (isExplosionMessage(message)) {
+        const unsigned slot = field<unsigned>(message, 0x0c);
+        if (slot < detonatedExplosives.size()) {
+            if (void* objects = dynamicObjectArray()) {
+                void* object = mappedDynamicObject(objects, slot);
+                if (object && field<void*>(object, 0x34) == room && hasExplosionScript(object)) {
+                    detonatedExplosives[slot] = object;
+                    if (diagnostic) {
+                        char messageText[100];
+                        sprintf_s(messageText, "Explosive ESP removed after detonation: object %u\r\n", slot);
+                        log(messageText);
+                    }
+                }
+            }
+        }
+    }
+    originalLevelProjectile(self, message, room, position, target, rotation);
+}
+
+void __fastcall unloadLevelProjectiles(void* self, void*) {
+    detonatedExplosives.fill(nullptr);
+    originalProjectileUnload(self);
+}
+
+void __fastcall loadLevelProjectiles(void* self, void*, void* file, const void* rooms, const void* materials) {
+    detonatedExplosives.fill(nullptr);
+    originalProjectileLoad(self, file, rooms, materials);
+}
+
+void captureExplosives() {
+    using GetName = const LegacyString*(__thiscall*)(void*);
+    void* objects = dynamicObjectArray();
     if (!objects) return;
-    const int slots = field<int>(objects, 4);
-    if (slots < 0 || slots > 32768) return;
-    for (int index = 0; index < slots && itemCount < items.size(); ++index) {
-        if (!at<IsValid>(messages, 0xc2b0)(objects, index)) continue;
-        void* object = *at<GetMapped>(messages, 0xc2c0)(objects, index);
+    const unsigned slots = field<unsigned>(objects, 4);
+    if (slots > detonatedExplosives.size()) return;
+    for (unsigned index = 0; index < slots && itemCount < items.size(); ++index) {
+        void* object = mappedDynamicObject(objects, index);
+        if (detonatedExplosives[index] != object) detonatedExplosives[index] = nullptr;
+        const ExplosiveRef explosive{object, index};
+        if (hasDetonated(explosive)) continue;
         if (!object || !at<GetBool>(gameObjects, 0xc5b20)(object) || field<Byte>(object, 0x295)) continue;
+        // Stock blastable props lose their dynamic-object hit points on impact or chain damage.
+        if (!(field<float>(object, 0x2c8) > 0.0f)) continue;
         auto* base = static_cast<Byte*>(object) + 0x30;
         if (!at<GetBool>(levelRuntime, 0x1430)(base)) continue;
         const auto& state = *at<GetName>(gameObjects, 0xa6930)(object);
@@ -290,7 +346,7 @@ void captureExplosives() {
         const auto& name = *at<GetName>(levelRuntime, 0x1420)(base);
         Vec position = *at<GetVec>(levelRuntime, 0x1aa0)(base);
         position.y += 0.30f;
-        items[itemCount++] = {position, ItemKind::explosive, explosiveIconFor({name.text(), name.length})};
+        items[itemCount++] = {position, ItemKind::explosive, explosiveIconFor({name.text(), name.length}), explosive};
     }
 }
 
@@ -311,7 +367,7 @@ void __fastcall captureLevelItems(void* implementation, void*) {
                 if (itemEnabled(pickup.kind)) {
                     Vec position = *at<GetVec>(levelRuntime, 0x1aa0)(item);
                     position.y += 0.12f;
-                    items[itemCount++] = {position, pickup.kind, pickup.icon};
+                    items[itemCount++] = {position, pickup.kind, pickup.icon, {}};
                 }
             }
             at<Next>(gameObjects, 0xf0500)(&node);
@@ -599,11 +655,12 @@ void projectTargets(void* camera) {
         const float limit = static_cast<float>(espDistances[settings.itemDistance].meters);
         for (size_t index = 0; index < itemCount; ++index) {
             const auto& item = items[index];
-            if (!itemEnabled(item.kind) || !withinEspDistance(playerPosition, item.position, limit * limit)) continue;
+            if (!itemEnabled(item.kind) || hasDetonated(item.explosive) ||
+                !withinEspDistance(playerPosition, item.position, limit * limit)) continue;
             Point position;
             if (!screenPoint(item.position, position) || position.x <= 0 || position.x >= 1 ||
                 position.y <= 0 || position.y >= 1) continue;
-            itemMarkers[itemMarkerCount++] = {position, item.kind, item.icon};
+            itemMarkers[itemMarkerCount++] = {position, item.kind, item.icon, item.explosive};
             ++projectedItems[static_cast<size_t>(item.kind)];
         }
     }
@@ -759,6 +816,7 @@ unsigned drawItemIcons(const Viewport& viewport, bool useWeaponTexture) {
     unsigned weaponCount = 0;
     for (size_t index = 0; index < itemMarkerCount; ++index) {
         const auto& marker = itemMarkers[index];
+        if (hasDetonated(marker.explosive)) continue;
         const float x = static_cast<float>(viewport.x) + marker.position.x * static_cast<float>(viewport.width);
         const float y = static_cast<float>(viewport.y) + marker.position.y * static_cast<float>(viewport.height);
         const bool atlasIcon = marker.icon >= Icon::grenade;
@@ -1214,7 +1272,10 @@ extern "C" DWORD WINAPI Initialize(void* options) {
     settings = readSettings(profilePath);
 
     const auto input = GetModuleHandleW(L"X_Inputmfc.dll");
-    if (!input || *at<void**>(input, 0xa94c) != at<void*>(input, 0x6cf0)) return 0;
+    if (!input || *at<void**>(input, 0xa94c) != at<void*>(input, 0x6cf0) ||
+        *at<void**>(gameObjects, 0x1218b0) != at<void*>(gameObjects, 0x98a00) ||
+        *at<void**>(gameObjects, 0x1218bc) != at<void*>(gameObjects, 0x992f0) ||
+        *at<void**>(gameObjects, 0x1218d0) != at<void*>(gameObjects, 0x98680)) return 0;
     const ImportChange changes[] = {
         change(input, 0xa94c, originalMouseUpdate, &updateMouse),
         change(exe, 0xe4a30, originalPost, &postPhysics),
@@ -1225,6 +1286,9 @@ extern "C" DWORD WINAPI Initialize(void* options) {
         change(gameObjects, 0x11acf8, originalShake[1], &weaponShake<1>),
         change(gameObjects, 0x11ad00, originalShake[2], &weaponShake<2>),
         change(gameObjects, 0x11ad04, originalShake[3], &weaponShake<3>),
+        change(gameObjects, 0x1218b0, originalProjectileUnload, &unloadLevelProjectiles),
+        change(gameObjects, 0x1218bc, originalProjectileLoad, &loadLevelProjectiles),
+        change(gameObjects, 0x1218d0, originalLevelProjectile, &createLevelProjectile),
     };
     size_t applied = 0;
     while (applied < std::size(changes)) {
